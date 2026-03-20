@@ -40,6 +40,17 @@ async function main() {
   const allArgs = process.argv.slice(2);
   const useTui = allArgs.includes('--tui');
 
+  if (allArgs[0] === 'mcp') {
+    const mcpProcess = spawn(process.execPath, [scriptPath, ...allArgs], { stdio: 'inherit', shell: false });
+    mcpProcess.on('error', (err) => {
+      console.error('❌ Failed to start Vibepup MCP server.');
+      console.error(String(err));
+      process.exit(1);
+    });
+    mcpProcess.on('close', (code) => process.exit(code));
+    return;
+  }
+
   let selectedPlatform = null;
   let explicitPlatformFlag = false;
   const args = [];

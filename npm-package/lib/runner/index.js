@@ -5,15 +5,40 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 
+const { loadUserConfig, parseArgString } = require('../config');
+const {
+  appendActivity,
+  allTasksCompleted,
+  completionMarkersPresent,
+  detectPhase,
+  ensureDir,
+  ensureProjectFiles,
+  getCurrentTask,
+  summarizeStatus,
+  writeRunState,
+} = require('../playbook');
+const { resolvePreset, PRESETS } = require('../presets');
+const { runValidation } = require('../validation');
+const { writeSourceToSpecs } = require('../sources');
+const {
+  buildCommitMessage,
+  commitChanges,
+  getDiffForReview,
+  isGitRepo,
+  writeReviewFiles,
+} = require('../git');
+
 const ENGINE_DIR = path.resolve(__dirname, '..');
 const PROJECT_DIR = process.cwd();
 const RUNS_DIR = path.join(PROJECT_DIR, '.ralph', 'runs');
 
 const DEFAULT_ITERATIONS = 5;
+const DEFAULT_CIRCUIT_BREAKER_FAILURES = 3;
+const DEFAULT_CIRCUIT_BREAKER_ERRORS = 5;
 const RALPH_MAX_TURN_SECONDS = Number.parseInt(process.env.RALPH_MAX_TURN_SECONDS || '900', 10);
 const RALPH_NO_OUTPUT_SECONDS = Number.parseInt(process.env.RALPH_NO_OUTPUT_SECONDS || '180', 10);
 
-const BUILD_MODELS_PREF = [
+const DEFAULT_BUILD_MODELS_PREF = [
   'github-copilot/gpt-5.2-codex',
   'github-copilot/claude-sonnet-4.5',
   'github-copilot/gemini-3-pro-preview',
@@ -26,7 +51,7 @@ const BUILD_MODELS_PREF = [
   'opencode/grok-code',
 ];
 
-const PLAN_MODELS_PREF = [
+const DEFAULT_PLAN_MODELS_PREF = [
   'github-copilot/claude-opus-4.5',
   'github-copilot/gemini-3-pro-preview',
   'github-copilot-enterprise/claude-opus-4.5',
@@ -39,66 +64,119 @@ const PLAN_MODELS_PREF = [
 
 const SYSTEM_PROMPT = path.join(ENGINE_DIR, 'prompt.md');
 const ARCHITECT_FILE = path.join(ENGINE_DIR, 'agents', 'architect.md');
+const REVIEWER_FILE = path.join(ENGINE_DIR, 'agents', 'reviewer.md');
+
+const userConfig = loadUserConfig();
 
 const parseArgs = () => {
-  const args = process.argv.slice(2);
-  let iterations = DEFAULT_ITERATIONS;
-  let watchMode = false;
-  let mode = 'default';
-  let projectIdea = '';
-  let freeMode = false;
-  let doctorMode = false;
-  let designMode = false;
+  const rawArgs = process.argv.slice(2);
+  const commandNames = new Set(['run', 'new', 'free', 'doctor', 'fetch', 'init', 'plan', 'status', 'validate', 'mcp']);
+  const options = {
+    command: 'run',
+    iterations: DEFAULT_ITERATIONS,
+    watchMode: false,
+    projectIdea: '',
+    designMode: false,
+    validate: false,
+    review: false,
+    commit: false,
+    sourceInput: '',
+    fetchInput: '',
+    preset: '',
+    completionPromise: '<promise>COMPLETE</promise>',
+    requireExitSignal: false,
+    circuitBreakerFailures: DEFAULT_CIRCUIT_BREAKER_FAILURES,
+    circuitBreakerErrors: DEFAULT_CIRCUIT_BREAKER_ERRORS,
+    forcedPhase: '',
+    extraPromptSuffix: '',
+  };
+
+  let args = rawArgs.slice();
+  if (args[0] && commandNames.has(args[0])) {
+    options.command = args[0];
+    args = args.slice(1);
+  } else if (args[0] === '--doctor') {
+    options.command = 'doctor';
+    args = args.slice(1);
+  }
+
+  if (options.command === 'new') {
+    options.projectIdea = args.join(' ').trim();
+    return options;
+  }
+
+  if (options.command === 'fetch') {
+    options.fetchInput = args.join(' ').trim();
+    return options;
+  }
 
   let index = 0;
   while (index < args.length) {
     const arg = args[index];
-    if (arg === 'free') {
-      freeMode = true;
-      index += 1;
-      continue;
-    }
-    if (arg === 'doctor' || arg === '--doctor') {
-      doctorMode = true;
-      index += 1;
-      continue;
-    }
-    if (arg === 'new') {
-      mode = 'new';
-      projectIdea = args[index + 1] || '';
-      index += 2;
-      continue;
-    }
-    if (arg === '--watch') {
-      watchMode = true;
-      index += 1;
-      continue;
-    }
-    if (arg === '--design') {
-      designMode = true;
-      index += 1;
-      continue;
-    }
     if (/^\d+$/.test(arg)) {
-      iterations = Number.parseInt(arg, 10);
+      options.iterations = Number.parseInt(arg, 10);
       index += 1;
       continue;
     }
-    index += 1;
+
+    switch (arg) {
+      case '--watch':
+        options.watchMode = true;
+        index += 1;
+        break;
+      case '--design':
+        options.designMode = true;
+        index += 1;
+        break;
+      case '--validate':
+        options.validate = true;
+        index += 1;
+        break;
+      case '--review':
+        options.review = true;
+        index += 1;
+        break;
+      case '--commit':
+        options.commit = true;
+        index += 1;
+        break;
+      case '--from':
+        options.sourceInput = args[index + 1] || '';
+        index += 2;
+        break;
+      case '--preset':
+        options.preset = args[index + 1] || '';
+        index += 2;
+        break;
+      case '--completion-promise':
+        options.completionPromise = args[index + 1] || options.completionPromise;
+        index += 2;
+        break;
+      case '--require-exit-signal':
+        options.requireExitSignal = true;
+        index += 1;
+        break;
+      case '--circuit-breaker-failures':
+        options.circuitBreakerFailures = Number.parseInt(args[index + 1] || `${DEFAULT_CIRCUIT_BREAKER_FAILURES}`, 10);
+        index += 2;
+        break;
+      case '--circuit-breaker-errors':
+        options.circuitBreakerErrors = Number.parseInt(args[index + 1] || `${DEFAULT_CIRCUIT_BREAKER_ERRORS}`, 10);
+        index += 2;
+        break;
+      default:
+        index += 1;
+        break;
+    }
   }
 
-  return {
-    iterations,
-    watchMode,
-    mode,
-    projectIdea,
-    freeMode,
-    doctorMode,
-    designMode,
-  };
-};
+  if (options.command === 'plan') {
+    options.forcedPhase = 'PLAN';
+    if (options.iterations === DEFAULT_ITERATIONS) options.iterations = 1;
+  }
 
-const ensureDir = (dir) => fs.mkdirSync(dir, { recursive: true });
+  return options;
+};
 
 const md5File = (filePath) => {
   const content = fs.readFileSync(filePath, 'utf8');
@@ -114,9 +192,7 @@ const readTail = (filePath, maxLines) => {
   return lines.slice(Math.max(0, lines.length - maxLines)).join('\n');
 };
 
-const runCommand = (command, args, options = {}) => {
-  return spawnSync(command, args, { encoding: 'utf8', ...options });
-};
+const runCommand = (command, args, options = {}) => spawnSync(command, args, { encoding: 'utf8', ...options });
 
 const getNodeMajor = () => {
   const [major] = process.versions.node.split('.').map((part) => Number.parseInt(part, 10));
@@ -154,46 +230,14 @@ const printNpmPermissionHelp = (prefix) => {
   console.error('      sudo npm install -g opencode-ai opencode-antigravity-auth');
 };
 
-const ensureProjectFiles = () => {
-  if (!fileExists(path.join(PROJECT_DIR, 'prd.md'))) {
-    if (fileExists(path.join(PROJECT_DIR, 'prd.json'))) {
-      console.log('🔄 Migrating legacy prd.json to prd.md...');
-      const data = JSON.parse(fs.readFileSync(path.join(PROJECT_DIR, 'prd.json'), 'utf8'));
-      const lines = data.map((item) => `- [ ] ${item.description}`);
-      fs.writeFileSync(path.join(PROJECT_DIR, 'prd.md'), lines.join('\n') + '\n', 'utf8');
-      fs.renameSync(path.join(PROJECT_DIR, 'prd.json'), path.join(PROJECT_DIR, 'prd.json.bak'));
-    } else {
-      console.log('⚠️  No prd.md found. Initializing...');
-      const init = [
-        '# Product Requirements Document (PRD)',
-        '',
-        '- [ ] Initialize repo-map.md with project architecture',
-        '- [ ] Setup initial project structure',
-        '',
-      ].join('\n');
-      fs.writeFileSync(path.join(PROJECT_DIR, 'prd.md'), init, 'utf8');
-    }
-  }
-
-  if (!fileExists(path.join(PROJECT_DIR, 'repo-map.md'))) {
-    fs.writeFileSync(path.join(PROJECT_DIR, 'repo-map.md'), '', 'utf8');
-  }
-
-  if (!fileExists(path.join(PROJECT_DIR, 'prd.state.json'))) {
-    fs.writeFileSync(path.join(PROJECT_DIR, 'prd.state.json'), '{}', 'utf8');
-  }
-
-  if (!fileExists(path.join(PROJECT_DIR, 'progress.log'))) {
-    fs.writeFileSync(path.join(PROJECT_DIR, 'progress.log'), '', 'utf8');
-  }
-};
-
-const detectPhase = () => {
-  const repoMapPath = path.join(PROJECT_DIR, 'repo-map.md');
-  if (!fileExists(repoMapPath)) return 'PLAN';
-  const content = fs.readFileSync(repoMapPath, 'utf8');
-  return content.trim().length === 0 ? 'PLAN' : 'BUILD';
-};
+const resolvePreferredModelLists = () => ({
+  build: Array.isArray(userConfig.build_models) && userConfig.build_models.length > 0
+    ? userConfig.build_models
+    : DEFAULT_BUILD_MODELS_PREF,
+  plan: Array.isArray(userConfig.plan_models) && userConfig.plan_models.length > 0
+    ? userConfig.plan_models
+    : DEFAULT_PLAN_MODELS_PREF,
+});
 
 const resolveAvailableModels = (prefModels) => {
   if (process.env.RALPH_MODEL_OVERRIDE) {
@@ -207,9 +251,7 @@ const resolveAvailableModels = (prefModels) => {
   const lines = output.split(/\r?\n/).filter((line) => /^[a-z0-9-]+\/[a-z0-9.-]+$/.test(line));
   const available = [];
   for (const pref of prefModels) {
-    if (lines.includes(pref)) {
-      available.push(pref);
-    }
+    if (lines.includes(pref)) available.push(pref);
   }
   if (available.length === 0) {
     console.error('⚠️  No preferred models found. Falling back to generic discovery.');
@@ -231,6 +273,7 @@ const runWithWatchdog = (logPath, command, args) => new Promise((resolve) => {
   const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   let lastOutput = Date.now();
   let killed = false;
+  const startTime = Date.now();
 
   const handleData = (data) => {
     lastOutput = Date.now();
@@ -263,8 +306,6 @@ const runWithWatchdog = (logPath, command, args) => new Promise((resolve) => {
     }
   }, 5000);
 
-  const startTime = Date.now();
-
   child.on('close', (code) => {
     clearInterval(interval);
     logStream.end();
@@ -272,41 +313,85 @@ const runWithWatchdog = (logPath, command, args) => new Promise((resolve) => {
   });
 });
 
-const runAgent = async (model, phase, iterDir, designMode) => {
+const contextFiles = (iterDir) => {
+  const files = [
+    SYSTEM_PROMPT,
+    path.join(PROJECT_DIR, 'prd.md'),
+    path.join(PROJECT_DIR, 'prd.state.json'),
+    path.join(PROJECT_DIR, 'repo-map.md'),
+    path.join(iterDir, 'progress.tail.log'),
+    path.join(PROJECT_DIR, 'AGENTS.md'),
+    path.join(PROJECT_DIR, 'IMPLEMENTATION_PLAN.md'),
+    path.join(PROJECT_DIR, 'specs', 'latest-source.md'),
+    path.join(PROJECT_DIR, '.ralph', 'validation.latest.txt'),
+    path.join(PROJECT_DIR, '.ralph', 'review.latest.txt'),
+  ];
+  return files.filter((filePath) => fs.existsSync(filePath));
+};
+
+const buildPromptSuffix = (phase, options, preset) => {
+  const parts = [];
+  if (options.designMode || process.env.DESIGN_MODE === 'true' || preset?.designMode) {
+    parts.push('MODE: DESIGN + BUILD. Apply the frontend-design skill guidelines to all work.');
+  } else if (phase === 'PLAN') {
+    parts.push('MODE: PLAN. Focus on exploring and mapping. Do NOT write implementation code yet.');
+  } else {
+    parts.push('MODE: BUILD. Focus on completing tasks in prd.md and IMPLEMENTATION_PLAN.md.');
+  }
+
+  if (preset?.promptSuffix) parts.push(preset.promptSuffix);
+  if (options.extraPromptSuffix) parts.push(options.extraPromptSuffix);
+  return parts.join(' ');
+};
+
+const runAgent = async (model, phase, iterDir, options, preset) => {
   const logPath = path.join(iterDir, 'agent_response.txt');
-  let promptSuffix = '';
   const extraArgs = [];
 
-  if (designMode || process.env.DESIGN_MODE === 'true') {
-    console.log('   🎨 Design Mode Active: Injecting frontend-design skill...');
-    extraArgs.push('--file', path.join(process.env.HOME || '', '.config/opencode/skills/frontend-design.md'));
-    promptSuffix = 'MODE: DESIGN + BUILD. Apply the frontend-design skill guidelines to all work.';
+  if (options.designMode || process.env.DESIGN_MODE === 'true' || preset?.designMode) {
+    const designSkillPath = path.join(process.env.HOME || '', '.config/opencode/skills/frontend-design.md');
+    if (fs.existsSync(designSkillPath)) {
+      console.log('   🎨 Design Mode Active: Injecting frontend-design skill...');
+      extraArgs.push('--file', designSkillPath);
+    }
   }
 
   if (process.env.RALPH_EXTRA_ARGS) {
     console.log(`   ⚙️  Injecting custom args: ${process.env.RALPH_EXTRA_ARGS}`);
-    extraArgs.push(...process.env.RALPH_EXTRA_ARGS.split(' '));
-  }
-
-  if (!promptSuffix) {
-    promptSuffix = phase === 'PLAN'
-      ? 'MODE: PLAN. Focus on exploring and mapping. Do NOT write implementation code yet.'
-      : 'MODE: BUILD. Focus on completing tasks in prd.md.';
+    extraArgs.push(...parseArgString(process.env.RALPH_EXTRA_ARGS));
   }
 
   const args = [
     'run',
-    `Proceed with task. ${promptSuffix}`,
-    '--file', SYSTEM_PROMPT,
-    '--file', path.join(PROJECT_DIR, 'prd.md'),
-    '--file', path.join(PROJECT_DIR, 'prd.state.json'),
-    '--file', path.join(PROJECT_DIR, 'repo-map.md'),
-    '--file', path.join(iterDir, 'progress.tail.log'),
+    `Proceed with task. ${buildPromptSuffix(phase, options, preset)}`,
+    ...contextFiles(iterDir).flatMap((filePath) => ['--file', filePath]),
     ...extraArgs,
     '--model', model,
   ];
 
   return runWithWatchdog(logPath, 'opencode', args);
+};
+
+const runReviewer = async (model, iterDir) => {
+  const diffContent = getDiffForReview(PROJECT_DIR);
+  const diffPath = writeReviewFiles(iterDir, diffContent);
+  const logPath = path.join(iterDir, 'review_response.txt');
+  const args = [
+    'run',
+    'Review the current uncommitted changes. Approve only if the implementation looks correct and well-verified.',
+    '--file', REVIEWER_FILE,
+    '--file', diffPath,
+    '--file', path.join(PROJECT_DIR, 'prd.md'),
+    '--file', path.join(PROJECT_DIR, 'IMPLEMENTATION_PLAN.md'),
+    '--model', model,
+  ];
+  const exitCode = await runWithWatchdog(logPath, 'opencode', args);
+  const response = fs.readFileSync(logPath, 'utf8');
+  return {
+    exitCode,
+    response,
+    passed: exitCode === 0 && /<review>PASS<\/review>/i.test(response),
+  };
 };
 
 const runArchitect = (projectIdea, planModels) => {
@@ -405,9 +490,11 @@ const runFreeSetup = () => {
 
 const runDoctor = () => {
   console.log('🩺 Vibepup Doctor');
+  console.log(`- Node.js: ${process.versions.node}`);
+  console.log(`- config: ${userConfig && Object.keys(userConfig).length > 0 ? 'loaded' : 'defaults'}`);
+  console.log(`- presets: ${Object.keys(PRESETS).join(', ')}`);
 
   const nodeMajor = getNodeMajor();
-  console.log(`- Node.js: ${process.versions.node}`);
   if (nodeMajor < 20) {
     console.log('  ⚠️  Node 20+ required for opencode-antigravity-auth');
   }
@@ -418,9 +505,7 @@ const runDoctor = () => {
     const prefix = getNpmPrefix();
     if (prefix) {
       console.log(`- npm prefix: ${prefix}`);
-      if (!isWritable(prefix)) {
-        console.log('  ⚠️  npm prefix is not writable');
-      }
+      if (!isWritable(prefix)) console.log('  ⚠️  npm prefix is not writable');
     }
   } else {
     console.log('- npm: not found');
@@ -454,124 +539,386 @@ const runDoctor = () => {
   process.exit(0);
 };
 
-const { iterations, watchMode, mode, projectIdea, freeMode, doctorMode, designMode } = parseArgs();
+const updateLatestFeedback = (fileName, body) => {
+  const target = path.join(PROJECT_DIR, '.ralph', fileName);
+  fs.writeFileSync(target, body.trim() + '\n', 'utf8');
+};
 
-console.log('🐾 Vibepup v1.0 (CLI Mode)');
-console.log(`   Engine:  ${ENGINE_DIR}`);
-console.log(`   Context: ${PROJECT_DIR}`);
-console.log('   Tips:');
-console.log("   - Run 'vibepup free' for free-tier setup");
-console.log("   - Run 'vibepup new \"My idea\"' to bootstrap a project");
-console.log("   - Run 'vibepup --tui' for a guided interface");
+const buildErrorSignature = (context) => {
+  const input = JSON.stringify(context);
+  return crypto.createHash('sha1').update(input).digest('hex');
+};
 
-ensureDir(RUNS_DIR);
-ensureProjectFiles();
+const writeIterationSummary = (iterDir, payload) => {
+  fs.writeFileSync(path.join(iterDir, 'summary.json'), JSON.stringify(payload, null, 2) + '\n', 'utf8');
+};
 
-if (doctorMode) {
-  runDoctor();
-}
+const completionReached = (response, options) => {
+  const responseHasSignal = options.completionPromise
+    ? response.includes(options.completionPromise)
+    : response.includes('<promise>COMPLETE</promise>');
+  const markerReached = completionMarkersPresent(PROJECT_DIR);
+  const tasksDone = allTasksCompleted(PROJECT_DIR);
 
-if (freeMode) {
-  runFreeSetup();
-}
+  if (options.requireExitSignal) {
+    return responseHasSignal || markerReached;
+  }
 
-if (!ensureOpencode(freeMode)) {
-  process.exit(127);
-}
+  return responseHasSignal || markerReached || tasksDone;
+};
 
-const buildModels = resolveAvailableModels(BUILD_MODELS_PREF);
-const planModels = resolveAvailableModels(PLAN_MODELS_PREF);
+const prepareIterationContext = (iterDir) => {
+  ensureDir(iterDir);
+  const tail = readTail(path.join(PROJECT_DIR, 'progress.log'), 200);
+  fs.writeFileSync(path.join(iterDir, 'progress.tail.log'), tail, 'utf8');
+  const latestLink = path.join(RUNS_DIR, 'latest');
+  try {
+    if (fs.existsSync(latestLink)) fs.rmSync(latestLink, { recursive: true, force: true });
+  } catch (_) {}
+  try {
+    fs.symlinkSync(iterDir, latestLink, 'junction');
+  } catch (_) {}
+};
 
-if (mode === 'new') {
-  const code = runArchitect(projectIdea, planModels);
-  if (code !== 0) process.exit(code);
-  console.log('✅ Architect initialization complete.');
-}
+const syncImplementationPlan = () => {
+  const prdPath = path.join(PROJECT_DIR, 'prd.md');
+  const planPath = path.join(PROJECT_DIR, 'IMPLEMENTATION_PLAN.md');
+  if (!fs.existsSync(prdPath) || fs.existsSync(planPath)) return;
+  const tasks = fs.readFileSync(prdPath, 'utf8')
+    .split(/\r?\n/)
+    .filter((line) => /^- \[[ xX]\]/.test(line.trim()));
+  fs.writeFileSync(planPath, `# Implementation Plan\n\n${tasks.join('\n')}\n`, 'utf8');
+};
 
-let lastHash = md5File(path.join(PROJECT_DIR, 'prd.md'));
-let i = 1;
+const handleFetch = async (input) => {
+  ensureProjectFiles(PROJECT_DIR);
+  const source = await writeSourceToSpecs(PROJECT_DIR, input);
+  appendActivity(PROJECT_DIR, [
+    `## ${new Date().toISOString()} Source Imported`,
+    `- Kind: ${source.kind}`,
+    `- Title: ${source.title}`,
+    `- File: \`${path.relative(PROJECT_DIR, source.path)}\``,
+    '',
+  ]);
+  console.log(`✅ Imported source into ${path.relative(PROJECT_DIR, source.path)}`);
+};
 
-const runLoop = async () => {
+const printStatus = () => {
+  ensureProjectFiles(PROJECT_DIR);
+  const status = summarizeStatus(PROJECT_DIR);
+  console.log('📋 Vibepup Status');
+  console.log(`- Phase: ${status.phase}`);
+  console.log(`- Current task: ${status.currentTask || 'none'}`);
+  console.log(`- All tasks completed: ${status.allTasksCompleted ? 'yes' : 'no'}`);
+  console.log(`- Completion marker present: ${status.completionMarkerPresent ? 'yes' : 'no'}`);
+  if (status.runState) {
+    console.log(`- Last iteration: ${status.runState.iteration || 0}`);
+    console.log(`- Last result: ${status.runState.result || 'unknown'}`);
+  }
+};
+
+const runValidateCommand = () => {
+  ensureProjectFiles(PROJECT_DIR);
+  const iterDir = path.join(RUNS_DIR, 'manual-validate');
+  ensureDir(iterDir);
+  const result = runValidation(PROJECT_DIR, iterDir);
+  console.log(result.summary);
+  process.exit(result.status === 'failed' ? 1 : 0);
+};
+
+const runInit = () => {
+  ensureProjectFiles(PROJECT_DIR);
+  syncImplementationPlan();
+  console.log('✅ Vibepup playbook files are ready.');
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const main = async () => {
+  const options = parseArgs();
+  const preset = resolvePreset(options.preset);
+  if (preset) {
+    options.validate = options.validate || Boolean(preset.validate);
+    options.review = options.review || Boolean(preset.review);
+    options.designMode = options.designMode || Boolean(preset.designMode);
+    options.requireExitSignal = options.requireExitSignal || Boolean(preset.requireExitSignal);
+    if (options.iterations === DEFAULT_ITERATIONS && preset.iterations) options.iterations = preset.iterations;
+    if (options.circuitBreakerFailures === DEFAULT_CIRCUIT_BREAKER_FAILURES && preset.circuitBreakerFailures) {
+      options.circuitBreakerFailures = preset.circuitBreakerFailures;
+    }
+    if (options.circuitBreakerErrors === DEFAULT_CIRCUIT_BREAKER_ERRORS && preset.circuitBreakerErrors) {
+      options.circuitBreakerErrors = preset.circuitBreakerErrors;
+    }
+  }
+
+  if (options.command === 'mcp') {
+    ensureDir(RUNS_DIR);
+    ensureProjectFiles(PROJECT_DIR);
+    syncImplementationPlan();
+    const { startMcpServer } = require('../mcp/server');
+    startMcpServer({
+      projectDir: PROJECT_DIR,
+      runnerPath: __filename,
+    });
+    return;
+  }
+
+  console.log('🐾 Vibepup v1.1 (CLI Mode)');
+  console.log(`   Engine:  ${ENGINE_DIR}`);
+  console.log(`   Context: ${PROJECT_DIR}`);
+  if (options.preset) console.log(`   Preset:  ${options.preset}`);
+  console.log('   Tips:');
+  console.log("   - Run 'vibepup free' for free-tier setup");
+  console.log("   - Run 'vibepup new \"My idea\"' to bootstrap a project");
+  console.log("   - Run 'vibepup --tui' for a guided interface");
+
+  ensureDir(RUNS_DIR);
+  ensureProjectFiles(PROJECT_DIR);
+  syncImplementationPlan();
+
+  if (options.command === 'doctor') runDoctor();
+  if (options.command === 'free') runFreeSetup();
+  if (options.command === 'init') {
+    runInit();
+    return;
+  }
+  if (options.command === 'status') {
+    printStatus();
+    return;
+  }
+  if (options.command === 'validate') {
+    runValidateCommand();
+    return;
+  }
+  if (options.command === 'fetch') {
+    await handleFetch(options.fetchInput);
+    return;
+  }
+
+  if (!ensureOpencode(options.command === 'free')) process.exit(127);
+
+  const preferredModels = resolvePreferredModelLists();
+  const buildModels = resolveAvailableModels(preferredModels.build);
+  const planModels = resolveAvailableModels(preferredModels.plan);
+
+  if (options.command === 'new') {
+    const code = runArchitect(options.projectIdea, planModels);
+    if (code !== 0) process.exit(code);
+    console.log('✅ Architect initialization complete.');
+  }
+
+  const maybeImportSource = async () => {
+    if (!options.sourceInput) return null;
+    const source = await writeSourceToSpecs(PROJECT_DIR, options.sourceInput);
+    appendActivity(PROJECT_DIR, [
+      `## ${new Date().toISOString()} Source Imported`,
+      `- Kind: ${source.kind}`,
+      `- Title: ${source.title}`,
+      `- File: \`${path.relative(PROJECT_DIR, source.path)}\``,
+      '',
+    ]);
+    return source;
+  };
+
+  let lastHash = md5File(path.join(PROJECT_DIR, 'prd.md'));
+  let iteration = 1;
+
+  await maybeImportSource();
+  const circuitState = {
+    consecutiveFailures: 0,
+    repeatedErrorCount: 0,
+    lastErrorSignature: '',
+  };
+
   while (true) {
     const currentHash = md5File(path.join(PROJECT_DIR, 'prd.md'));
     if (currentHash !== lastHash) {
       console.log('👀 PRD Changed! Restarting loop...');
       fs.appendFileSync(path.join(PROJECT_DIR, 'progress.log'), '--- PRD CHANGED: RESTARTING LOOP ---\n', 'utf8');
       lastHash = currentHash;
-      if (watchMode) {
-        i = 1;
-      }
+      if (options.watchMode) iteration = 1;
     }
 
-    if (!watchMode && i > iterations) {
+    if (!options.watchMode && iteration > options.iterations) {
       console.log('⏸️  Max iterations reached.');
       break;
     }
 
-    const phase = detectPhase();
-    const iterId = `iter-${String(i).padStart(4, '0')}`;
+    const phase = detectPhase(PROJECT_DIR, options.forcedPhase);
+    const currentTask = getCurrentTask(PROJECT_DIR);
+    const iterId = `iter-${String(iteration).padStart(4, '0')}`;
     const iterDir = path.join(RUNS_DIR, iterId);
-    ensureDir(iterDir);
-    const tail = readTail(path.join(PROJECT_DIR, 'progress.log'), 200);
-    fs.writeFileSync(path.join(iterDir, 'progress.tail.log'), tail, 'utf8');
-    const latestLink = path.join(RUNS_DIR, 'latest');
-    try {
-      if (fileExists(latestLink)) fs.rmSync(latestLink, { recursive: true, force: true });
-    } catch (_) {}
-    try {
-      fs.symlinkSync(iterDir, latestLink, 'junction');
-    } catch (_) {}
+    prepareIterationContext(iterDir);
 
     console.log('');
-    console.log(`🔁 Loop ${i} (${phase} Phase)`);
+    console.log(`🔁 Loop ${iteration} (${phase} Phase)`);
     console.log(`   Logs: ${iterDir}`);
+    if (currentTask) console.log(`   Task: ${currentTask}`);
+
+    writeRunState(PROJECT_DIR, {
+      startedAt: new Date().toISOString(),
+      iteration,
+      phase,
+      currentTask,
+      result: 'running',
+      latestRunDir: iterDir,
+      preset: options.preset || null,
+    });
 
     const models = phase === 'PLAN' ? planModels : buildModels;
+    let result = 'agent_failed';
     let success = false;
+    let response = '';
+    let validationResult = null;
+    let reviewResult = null;
+    let commitResult = null;
+    let errorSummary = '';
 
     for (const model of models) {
       console.log(`   Using: ${model}`);
-      const exitCode = await runAgent(model, phase, iterDir, designMode);
-      const response = fs.readFileSync(path.join(iterDir, 'agent_response.txt'), 'utf8');
+      const exitCode = await runAgent(model, phase, iterDir, options, preset);
+      response = fs.readFileSync(path.join(iterDir, 'agent_response.txt'), 'utf8');
 
       if (/not supported|ModelNotFoundError|Make sure the model is enabled/i.test(response)) {
         console.log(`   ⚠️  Model ${model} not supported. Falling back...`);
         continue;
       }
 
-      if (exitCode === 0 && response.trim().length > 0) {
-        success = true;
-        if (response.includes('<promise>COMPLETE</promise>')) {
-          console.log('✅ Agent signaled completion.');
-          if (!watchMode) {
-            process.exit(0);
-          }
-          console.log('⏸️  Project Complete. Waiting for changes in prd.md...');
-          while (md5File(path.join(PROJECT_DIR, 'prd.md')) === lastHash) {
-            await new Promise((resolve) => setTimeout(resolve, 2000));
-          }
-          console.log('👀 Change detected! Resuming...');
-          i = 1;
-          break;
-        }
-        break;
+      if (exitCode !== 0 || response.trim().length === 0) {
+        errorSummary = `Model ${model} failed (exit ${exitCode}).`;
+        console.log(`   ⚠️  ${errorSummary} Falling back...`);
+        continue;
       }
 
-      console.log(`   ⚠️  Model ${model} failed (Exit: ${exitCode}). Falling back...`);
+      success = true;
+      result = 'agent_passed';
+
+      if (options.validate && phase !== 'PLAN') {
+        validationResult = runValidation(PROJECT_DIR, iterDir);
+        updateLatestFeedback('validation.latest.txt', [
+          `Validation status: ${validationResult.status}`,
+          validationResult.summary,
+        ].join('\n'));
+        fs.appendFileSync(path.join(PROJECT_DIR, 'progress.log'), `[validation] ${validationResult.summary}\n`, 'utf8');
+        if (validationResult.status === 'failed') {
+          result = 'validation_failed';
+          success = false;
+          errorSummary = validationResult.summary;
+          break;
+        }
+      }
+
+      if (options.review && phase !== 'PLAN' && isGitRepo(PROJECT_DIR)) {
+        reviewResult = await runReviewer(model, iterDir);
+        updateLatestFeedback('review.latest.txt', reviewResult.response || 'Review did not produce output.');
+        if (!reviewResult.passed) {
+          result = 'review_failed';
+          success = false;
+          errorSummary = 'Review rejected the current changes.';
+          break;
+        }
+      }
+
+      if (options.commit && phase !== 'PLAN' && isGitRepo(PROJECT_DIR)) {
+        commitResult = commitChanges(PROJECT_DIR, buildCommitMessage(currentTask, options.preset));
+        if (commitResult.status === 'failed') {
+          result = 'commit_failed';
+          success = false;
+          errorSummary = commitResult.summary;
+          break;
+        }
+      }
+
+      break;
     }
 
     if (!success) {
-      console.log('❌ All models failed this iteration.');
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      circuitState.consecutiveFailures += 1;
+      const signature = buildErrorSignature({
+        result,
+        errorSummary,
+        currentTask,
+      });
+      circuitState.repeatedErrorCount = signature === circuitState.lastErrorSignature
+        ? circuitState.repeatedErrorCount + 1
+        : 1;
+      circuitState.lastErrorSignature = signature;
+      if (!errorSummary) errorSummary = 'All models failed this iteration.';
+      console.log(`❌ ${errorSummary}`);
+    } else {
+      circuitState.consecutiveFailures = 0;
+      circuitState.repeatedErrorCount = 0;
+      circuitState.lastErrorSignature = '';
+    }
+
+    writeIterationSummary(iterDir, {
+      iteration,
+      phase,
+      currentTask,
+      result,
+      validation: validationResult,
+      review: reviewResult ? { passed: reviewResult.passed } : null,
+      commit: commitResult,
+      circuitState,
+    });
+
+    writeRunState(PROJECT_DIR, {
+      updatedAt: new Date().toISOString(),
+      iteration,
+      phase,
+      currentTask,
+      result,
+      latestRunDir: iterDir,
+      validationStatus: validationResult?.status || null,
+      reviewPassed: reviewResult?.passed ?? null,
+      commitStatus: commitResult?.status || null,
+      consecutiveFailures: circuitState.consecutiveFailures,
+      repeatedErrorCount: circuitState.repeatedErrorCount,
+      preset: options.preset || null,
+    });
+
+    appendActivity(PROJECT_DIR, [
+      `## ${new Date().toISOString()} Iteration ${iteration}`,
+      `- Phase: ${phase}`,
+      `- Task: ${currentTask || 'none'}`,
+      `- Result: ${result}`,
+      `- Validation: ${validationResult?.status || 'not-run'}`,
+      `- Review: ${reviewResult ? (reviewResult.passed ? 'passed' : 'failed') : 'not-run'}`,
+      `- Commit: ${commitResult?.status || 'not-run'}`,
+      '',
+    ]);
+
+    if (success && completionReached(response, options)) {
+      console.log('✅ Agent signaled completion.');
+      if (!options.watchMode) {
+        process.exit(0);
+      }
+      console.log('⏸️  Project Complete. Waiting for changes in prd.md...');
+      while (md5File(path.join(PROJECT_DIR, 'prd.md')) === lastHash) {
+        await sleep(2000);
+      }
+      console.log('👀 Change detected! Resuming...');
+      iteration = 1;
+      lastHash = md5File(path.join(PROJECT_DIR, 'prd.md'));
+      continue;
+    }
+
+    if (circuitState.consecutiveFailures >= options.circuitBreakerFailures) {
+      console.log(`🛑 Circuit breaker tripped after ${circuitState.consecutiveFailures} consecutive failures.`);
+      process.exit(1);
+    }
+    if (circuitState.repeatedErrorCount >= options.circuitBreakerErrors) {
+      console.log(`🛑 Circuit breaker tripped after repeating the same error ${circuitState.repeatedErrorCount} times.`);
+      process.exit(1);
     }
 
     lastHash = md5File(path.join(PROJECT_DIR, 'prd.md'));
-    i += 1;
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    iteration += 1;
+    await sleep(success ? 1000 : 2000);
   }
 };
 
-runLoop().catch((err) => {
+main().catch((err) => {
   console.error('❌ Vibepup runner failed.');
   console.error(String(err));
   process.exit(1);

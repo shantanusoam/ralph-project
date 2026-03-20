@@ -8,6 +8,7 @@
   "scripts": {
     "test": "node --test",
     "build": "cd tui && go build -o vibepup-tui .",
+    "build:tui": "cd tui && go build -o vibepup-tui .",
     "run:local": "node bin/ralph.js",
     "pack:local": "npm run build && npm pack"
   },
@@ -23,7 +24,9 @@
     "llm",
     "dev-tool",
     "dx",
-    "vibe-coding"
+    "vibe-coding",
+    "mcp",
+    "autonomous-coding"
   ],
   "author": "Shantanu Soam",
   "license": "MIT",
